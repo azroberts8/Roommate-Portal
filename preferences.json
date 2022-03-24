@@ -1,0 +1,9 @@
+{
+    "port": 5000,
+    "db": {
+        "hostname": null,
+        "db": null,
+        "username": null,
+        "password": null
+    }
+}
