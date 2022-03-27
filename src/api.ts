@@ -1,5 +1,5 @@
 import { Client, bcrypt } from "../deps.ts";
-import { UserError } from "./security.ts";
+import { InputError } from "./security.ts";
 
 interface FullUser {
     uname: string,
@@ -102,7 +102,7 @@ export class API {
      */
     public async getFullUser(sessionToken: string): Promise<FullUser> {
         return await this.client.query('SELECT Users.Uname AS uname, BIN_TO_ID(Sessions.Token) AS sessionToken, Sessions.Expires AS tokenExpires, Users.DateJoined AS dateJoined, Users.Fname AS firstName, Users.Lname AS lastName, Users.Email AS email FROM Users RIGHT JOIN Sessions ON Users.UID = Sessions.UID WHERE Sessions.Token = ID_TO_BIN(?) AND Sessions.Active = 1 AND Sessions.Expires > NOW() LIMIT 1;', [sessionToken]).then(async res => {
-            if(res.length == 0) throw new UserError('Invalid Session Token', `'${sessionToken}' is expired or does not exist.`);
+            if(res.length == 0) throw new InputError('Invalid Session Token', `'${sessionToken}' is expired or does not exist.`, sessionToken);
             return await res[0];
         });
     }
@@ -304,11 +304,11 @@ export class API {
      */
     public async login(uname: string, password: string): Promise<Dashboard> {
         return await this.client.query('SELECT Uname AS uname, PwdHash AS hash, FailedLoginAttempts AS attempts FROM Users WHERE Uname = ? OR Email = ? LIMIT 1;', [uname, uname]).then(async res => {
-            if(await res.length < 1) throw new UserError('User Not Found', `'${ uname }' does not match any users.`);
-            if(await res[0].attempts > 5) throw new UserError('Account Locked', 'You have exceeded the maximum login attempts.');
+            if(await res.length < 1) throw new InputError('User Not Found', `'${ uname }' does not match any users.`, uname);
+            if(await res[0].attempts >= 5) throw new InputError('Account Locked', 'You have exceeded the maximum login attempts.', uname);
             if(!(await bcrypt.compare(password, await res[0].hash))) {
                 await this.client.execute('UPDATE Users SET FailedLoginAttempts = FailedLoginAttempts + 1 WHERE Uname = ? OR Email = ?;', [uname, uname]).then(() => {
-                    throw new UserError('Incorrect Password', `The password you ented for '${ uname }' is incorrect.`);
+                    throw new InputError('Incorrect Password', `The password you ented for '${ uname }' is incorrect.`, uname );
                 });
             }
         }).then(async () => {
@@ -318,6 +318,20 @@ export class API {
                     return this.getDashboard(await res[0].session);
                 });
             });
+        });
+    }
+
+    /**
+     * Validates a username and password combination
+     * @param uname Username of user to validate
+     * @param password Password to check
+     * @returns true/false whether the username-password combination is valid
+     */
+    public async validateCreds(uname: string, password: string): Promise<boolean> {
+        return await this.client.query('SELECT PwdHash AS hash FROM Users WHERE Uname = ? LIMIT 1;', [uname])
+        .then(async res => {
+            if(await res.length === 0) return false;
+            return await bcrypt.compare(password, await res[0].hash);
         });
     }
 
@@ -347,7 +361,7 @@ export class API {
     public async validateSession(uname: string, sessionToken: string): Promise<string> {
         return await this.client.query('SELECT Sessions.Expires AS expires FROM Sessions RIGHT JOIN Users ON Sessions.UID = Users.UID WHERE Users.Uname = ? AND Sessions.Token = ID_TO_BIN(?) AND Sessions.Expires > NOW() AND Sessions.Active = 1 LIMIT 1;', [uname, sessionToken])
         .then(async res => {
-            if(await res.length < 1) throw new UserError('Invalid Session', 'The provided username and token combination are invalid.');
+            if(await res.length < 1) throw new InputError('Invalid Session', 'The provided username and token combination are invalid.', `${ uname } -> ${ sessionToken }`);
 
             // if there is less than 3 weeks until expiration (been active a week), generate a new session token
             const today = new Date();
@@ -369,9 +383,9 @@ export class API {
     public async changePassword(uname: string, oldPassword: string, newPassword: string): Promise<void> {
         await this.client.query('SELECT PwdHash AS oldHash FROM Users WHERE Uname = ? LIMIT 1;', [uname])
         .then(async res => {
-            if(await res.length < 1) throw new UserError('User Not Found', `Could not update password for user '${uname}' because the user could not be found.`);
-            if(!(await bcrypt.compare(oldPassword, await res[0].oldHash))) throw new UserError('Incorrect Password', `Incorrect password for '${uname}'`);
-            if(await bcrypt.compare(newPassword, await res[0].oldHash)) throw new UserError('Cannot Reuse Password', 'Your new password cannot be the same as your old password.');
+            if(await res.length < 1) throw new InputError('User Not Found', `Could not update password for user '${uname}' because the user could not be found.`, uname);
+            if(!(await bcrypt.compare(oldPassword, await res[0].oldHash))) throw new InputError('Incorrect Password', `Incorrect password for '${uname}'`, uname);
+            if(await bcrypt.compare(newPassword, await res[0].oldHash)) throw new InputError('Cannot Reuse Password', 'Your new password cannot be the same as your old password.', newPassword);
         })
         .then(async () => {
             const salt = await bcrypt.genSalt(8);
@@ -428,8 +442,8 @@ export class API {
      * @returns Dashboard object
      */
     public async createUser(uname: string, password: string, firstname: string, lastname: string, email: string): Promise<Dashboard> {
-        if(await this.userExists(uname)) throw new UserError('Username Taken', `The username '${ uname }' is already in use by another user.`);
-        if(await this.emailExists(email)) throw new UserError('Email Address Taken', `The email address '${ email }' is already in use by other user.`);
+        if(await this.userExists(uname)) throw new InputError('Username Taken', `The username '${ uname }' is already in use by another user.`, uname);
+        if(await this.emailExists(email)) throw new InputError('Email Address Taken', `The email address '${ email }' is already in use by other user.`, email);
 
         const hash = bcrypt.hash(password, await bcrypt.genSalt(8));
         return await this.client.execute('INSERT INTO Users (UID, Uname, PwdHash, Fname, Lname, Email) VALUES(ID_TO_BIN(UUID()), ?, ?, ?, ?, ?);', [uname, await hash, firstname, lastname, email])
@@ -463,25 +477,25 @@ export class API {
      * @param gid Group ID of group to add user to
      */
     public async joinGroup(uname: string, gid: string): Promise<void> {
-        if(!(await this.userExists(uname))) throw new UserError('User Not Found', `Could not find user '${ uname }'.`)
-        if(!(await this.groupExists(gid))) throw new UserError('Group Not Found', `Could not find group identified by '${ gid }'`);
-        if(await this.isInGroup(uname, gid)) throw new UserError('Already In Group', `${ uname } is already a member of this group.`);
+        if(!(await this.userExists(uname))) throw new InputError('User Not Found', `Could not find user '${ uname }'.`, uname)
+        if(!(await this.groupExists(gid))) throw new InputError('Group Not Found', `Could not find group identified by '${ gid }'`, gid);
+        if(await this.isInGroup(uname, gid)) throw new InputError('Already In Group', `${ uname } is already a member of this group.`, uname);
 
         const group = await this.client.query('SELECT MaxUsers as max, Status as status, Name as name FROM Groups WHERE GID = ID_TO_BIN(?);', [gid]).then(async res => await res[0]);
-        if((await this.listGroupMembers(gid)).length >= await group.max) throw new UserError('Group Full', `The group '${ await group.name }' is at its maximum member capacity.`);
-        if(await group.status == 'locked') throw new UserError('Group Locked', `The group '${ await group.name }' is locked.`);
+        if(await group.max != null && (await this.listGroupMembers(gid)).length >= await group.max) throw new InputError('Group Full', `The group '${ await group.name }' is at its maximum member capacity.`, gid);
+        if(await group.status == 'locked') throw new InputError('Group Locked', `The group '${ await group.name }' is locked.`, gid);
 
         await this.client.execute('INSERT INTO Memberships (UID, GID, JoinedGroup) VALUES((SELECT UID FROM Users WHERE Uname = ? LIMIT 1), ID_TO_BIN(?), NOW());', [uname, gid]);
     }
 
     public async lockGroup(groupID: string): Promise<void> {
-        if(!(await this.groupExists(groupID))) throw new UserError('Group Not Found', `Could not find group identified by '${ groupID }'`);
+        if(!(await this.groupExists(groupID))) throw new InputError('Group Not Found', `Could not find group identified by '${ groupID }'`, groupID);
 
         await this.client.execute("UPDATE Groups SET Status = 'locked' WHERE GID = ID_TO_BIN(?);", [groupID]);
     }
 
     public async unlockGroup(groupID: string): Promise<void> {
-        if(!(await this.groupExists(groupID))) throw new UserError('Group Not Found', `Could not find group identified by '${ groupID }'`);
+        if(!(await this.groupExists(groupID))) throw new InputError('Group Not Found', `Could not find group identified by '${ groupID }'`, groupID);
 
         await this.client.execute("UPDATE Groups SET Status = 'open' WHERE GID = ID_TO_BIN(?);", [groupID]);
     }
@@ -492,9 +506,9 @@ export class API {
      * @param gid Group ID of group to remove user from
      */
     public async leaveGroup(uname: string, gid: string) {
-        if(!(await this.userExists(uname))) throw new UserError('User Not Found', `Could not find user '${uname}'.`);
-        if(!(await this.groupExists(gid))) throw new UserError('Group Not Found', `Could not find group identified by '${ gid }'`);
-        if(!(await this.isInGroup(uname, gid))) throw new UserError('Not In Group', `${ uname } is not a member of the specified group.`);
+        if(!(await this.userExists(uname))) throw new InputError('User Not Found', `Could not find user '${uname}'.`, uname);
+        if(!(await this.groupExists(gid))) throw new InputError('Group Not Found', `Could not find group identified by '${ gid }'`, gid);
+        if(!(await this.isInGroup(uname, gid))) throw new InputError('Not In Group', `${ uname } is not a member of the specified group.`, uname);
 
         await this.client.execute('UPDATE Memberships SET LeftGroup = NOW() WHERE UID = (SELECT UID FROM Users WHERE Uname = ? LIMIT 1) AND GID = ID_TO_BIN(?) AND LeftGroup IS NULL;', [uname, gid]);
     }
@@ -508,9 +522,9 @@ export class API {
      * @param members List of initial group members
      * @returns Object containing information about the new group
      */
-    public async createGroup(name: string, description: string, status: string, maxMembers: number, members: Array<string>): Promise<Group | undefined> {
-        if(members.length > maxMembers) maxMembers = members.length;
-        if(status != 'open' && status != 'locked') throw new UserError('Invalid Group Status', `"${ status }" is not a valid group status.`);
+    public async createGroup(name: string, description: string, status: string, maxMembers: number | undefined, members: Array<string>): Promise<Group | undefined> {
+        if(typeof maxMembers === 'number' && members.length > maxMembers) maxMembers = members.length;
+        if(status != 'open' && status != 'locked') throw new InputError('Invalid Group Status', `"${ status }" is not a valid group status.`, status);
 
         return await this.client.execute('INSERT INTO Groups (GID, Name, Description, Status, MaxUsers) VALUES(ID_TO_BIN(UUID()), ?, ?, ?, ?)', [name, description, 'open', maxMembers])
         .then(async () => await this.client.query('SELECT BIN_TO_ID(GID) AS groupID FROM Groups WHERE Name = ? ORDER BY Created DESC LIMIT 1;', [name]))
@@ -533,9 +547,9 @@ export class API {
      * @param notes Additional comments to tag with purchase
      */
     public async addPurchase(uname: string, groupID: string, amount: number, store?: string, date?: Date, notes?: string): Promise<void> {
-        if(!(await this.userExists(uname))) throw new UserError('User Not Found', `Purchase could not be added because '${ uname }' could not be found.`);
-        if(!(await this.groupExists(groupID))) throw new UserError('Group Not Found', `Purchase coudl not be added because the group '${ groupID }' could not be found.`);
-        if(!(await this.isInGroup(uname, groupID))) throw new UserError('User Not In Group', `${ uname } is not a member of the group ${ groupID }.`);
+        if(!(await this.userExists(uname))) throw new InputError('User Not Found', `Purchase could not be added because '${ uname }' could not be found.`, uname);
+        if(!(await this.groupExists(groupID))) throw new InputError('Group Not Found', `Purchase coudl not be added because the group '${ groupID }' could not be found.`, groupID);
+        if(!(await this.isInGroup(uname, groupID))) throw new InputError('User Not In Group', `${ uname } is not a member of the group ${ groupID }.`, `${uname} -> ${groupID}`);
         store = (typeof store == 'undefined') ? '' : store;
         date = (typeof date == 'undefined') ? new Date() : date;
         notes = (typeof notes == 'undefined') ? '' : notes;
@@ -565,7 +579,7 @@ export class API {
      * @param description Description of the incentive
      */
     public async createNewIncentive(groupID: string, name: string, amount: number, onPurchase: boolean, description?: string): Promise<void> {
-        if(!(await this.groupExists(groupID))) throw new UserError('Group Not Found', 'Could not create incentive because the group could not be found.');
+        if(!(await this.groupExists(groupID))) throw new InputError('Group Not Found', 'Could not create incentive because the group could not be found.', groupID);
         description = (typeof description == 'undefined') ? '' : description;
 
         await this.client.execute('INSERT INTO IncentivesAvailable (IID, GID, Name, Description, Amount, Begin, OnPurchase) VALUES(ID_TO_BIN(UUID()), ID_TO_BIN(?), ?, ?, ?, NOW(), ?);', [groupID, name, description, amount, onPurchase]);
@@ -579,8 +593,8 @@ export class API {
      * @param date Date that the incentive was performed
      */
     public async addIncentive(uname: string, incentiveID: string, notes?: string, date?: Date): Promise<void> {
-        if(!(await this.userExists(uname))) throw new UserError('User Not Found', `Incentive could not be added because '${ uname }' could not be found.`);
-        if(!(await this.incentiveExists(incentiveID))) throw new UserError('Incentive Not Found', 'Incentive could not be added because the ID provided could not be found.');
+        if(!(await this.userExists(uname))) throw new InputError('User Not Found', `Incentive could not be added because '${ uname }' could not be found.`, uname);
+        if(!(await this.incentiveExists(incentiveID))) throw new InputError('Incentive Not Found', 'Incentive could not be added because the ID provided could not be found.', incentiveID);
         notes = (typeof notes == 'undefined') ? '' : notes;
         date  = (typeof date == 'undefined') ? new Date() : date;
 

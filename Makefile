@@ -1,5 +1,5 @@
 run:
-	deno run --allow-net --allow-read=./static,settings.json mod.ts
+	deno run --allow-net --allow-read=./static,preferences.json mod.ts
 
 setup-db:
 	./setup/db-setup.sh
